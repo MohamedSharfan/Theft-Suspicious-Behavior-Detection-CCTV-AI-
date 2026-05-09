@@ -3,12 +3,19 @@
 
 import numpy as np
 from datetime import datetime
+import cv2
 
+
+def is_frame_blurry(frame, threshold=80):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return laplacian_var < threshold
 class FeatureExtractor:
     def __init__(self):
         self.history = {}
 
-    def update(self, track_id, bbox, frame_shape):
+
+    def update(self, track_id, bbox, frame_shape, pose_landmarks=None):
 
         TIMEOUT = 2
 
@@ -32,6 +39,8 @@ class FeatureExtractor:
                 "positions" : [],
                 "speeds" : [],
                 "angles": [],
+                "hand_distances":[],
+                "stop_count": 0,
                 "start_time": datetime.now(),
                 "last_seen": datetime.now()
             }
@@ -66,11 +75,18 @@ class FeatureExtractor:
 
             if movement < 0.002:
                 speed = 0
-                return None
+                person["stop_count"] += 1
             else:
-                speed = movement * fps
+                raw_speed = movement * fps
+                speed = raw_speed
             
             person["speeds"].append(speed)
+
+            # def smooth(values, alpha=0.7):
+            #     if len(values) < 2:
+            #         return values[-1]
+            #     return alpha * values[-1] + (1- alpha) * values[-2]
+
             if len(person["speeds"]) > MAX_HISTORY:
                 person["speeds"].pop(0)
 
@@ -101,6 +117,42 @@ class FeatureExtractor:
             # acceleration = (s1 - s2 + s2 - s3) / 2
             acceleration = s1 - s2
             
+
+        hand_distance = 0
+        crouching = False
+
+        if pose_landmarks:
+            try:
+                LEFT_WRIST = 15
+                RIGHT_WRIST = 16
+                LEFT_SHOULDER = 11
+                RIGHT_SHOULDER = 12
+
+                lw = np.array(pose_landmarks[LEFT_WRIST])
+                rw = np.array(pose_landmarks[RIGHT_WRIST])
+
+                ls = np.array(pose_landmarks[LEFT_SHOULDER])
+                rs = np.array(pose_landmarks[RIGHT_SHOULDER])
+
+                wrist_center = (lw + rw)/2
+                shoulder_center = (ls + rs) /2
+
+                hand_distance = np.linalg.norm(wrist_center - shoulder_center)
+
+                person["hand_distances"].append(hand_distance)
+
+                if len(person["hand_distances"]) > MAX_HISTORY:
+                    person["hand_distances"].pop(0)
+
+                shoulder_y = shoulder_center[1]
+                wrist_y = wrist_center[1]
+
+                crouching = wrist_y > shoulder_y + 0.25
+
+            except:
+                pass
+
+
         time_in_zone = (datetime.now() - person["start_time"]).total_seconds()
         time_in_zone = min(time_in_zone, 60)
 
@@ -113,5 +165,8 @@ class FeatureExtractor:
             "speed" : speed,
             "angle" : angle,
             "acceleration" : acceleration,
-            "time_in_zone" : time_in_zone
+            "time_in_zone" : time_in_zone,
+            "hand_distance": hand_distance,
+            "stop_count":person["stop_count"],
+            "crouching": crouching
         }

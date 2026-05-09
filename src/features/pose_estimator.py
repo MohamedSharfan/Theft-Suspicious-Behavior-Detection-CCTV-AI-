@@ -1,8 +1,9 @@
-import mediapipe as mp 
+import mediapipe as mp
+import cv2
 
 class PoseEstimator:
     def __init__(self):
-        self.mp_pose = mp.solution.pose
+        self.mp_pose = mp.solutions.pose
 
         self.pose = self.mp_pose.Pose(
             static_image_mode = False,
@@ -10,8 +11,9 @@ class PoseEstimator:
             min_tracking_confidence = 0.5
         )
 
-    def estimate(self, person_crop):
-        rgb = person_crop[:, :, ::-1]
+    def estimate(self, image):
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # rgb = person_crop[:, :, ::-1]
 
         results = self.pose.process(rgb)
 
