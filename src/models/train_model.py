@@ -8,7 +8,7 @@ df = pd.read_csv("./data/raw/features.csv")
 
 df = df[df["speed"] > 0.01]
 
-x = df[["speed", "angle", "acceleration", "time_in_zone"]]
+x = df[["speed", "angle", "acceleration", "time_in_zone", "hand_distance", "stop_count"]]
 
 scaler = StandardScaler()
 x_scaled = scaler.fit_transform(x)

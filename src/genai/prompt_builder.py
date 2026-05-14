@@ -5,10 +5,12 @@ def build_prompt(event):
     Analyze this structured behavior event:
 
     Person ID: {event["person_id"]}
-    Speed: {event["speed"]}
-    Acceleration: {event["acceleration"]}
     Direction change: {event["direction_change"]}
+    Hand Distance: {event["hand_distance"]}
+    Frequently stopping: {event["frequent_stopping"]}
+    crouching: {event["crouching"]}
     Loitering: {event["loitering"]}
+    Risk score: {event["risk_score"]}
     Location: {event["location"]}
 
     TASK:

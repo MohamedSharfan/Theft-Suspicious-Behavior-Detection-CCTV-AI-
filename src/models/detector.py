@@ -13,7 +13,11 @@ class AnomalyDetector:
             features["speed"],
             features["angle"],
             features["acceleration"],
-            features["time_in_zone"]
+            features["time_in_zone"],
+            features["hand_distance"],
+            features["stop_count"],
+            features["hand_speed"],
+            features["body_expansion"]
         ]])
 
         X_scaled = self.scaler.transform(X)
