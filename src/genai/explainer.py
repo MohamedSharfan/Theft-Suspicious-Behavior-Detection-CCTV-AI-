@@ -1,7 +1,10 @@
-from groq import Groq
-from src.genai.prompt_builder import build_prompt
-from dotenv import load_dotenv
+import json
 import os
+
+from dotenv import load_dotenv
+from groq import Groq
+
+from src.genai.prompt_builder import build_prompt
 
 load_dotenv()
 
@@ -49,6 +52,28 @@ def explain_event(event):
             temperature = 0.3
         )
 
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+
+        try:
+            return json.loads(content)
+        except Exception:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(content[start : end + 1])
+                except Exception:
+                    pass
+            return {
+                "suspicious": False,
+                "threat_level": "LOW",
+                "explanation": "Failed to parse AI response",
+                "alert_message": "No actionable threat detected"
+            }
     except Exception as e:
-        return f"Groq Error: {e}"
+        return {
+            "suspicious": False,
+            "threat_level": "LOW",
+            "explanation": f"Groq Error: {e}",
+            "alert_message": "No actionable threat detected"
+        }

@@ -3,13 +3,14 @@ import time
 from collections import deque
 from datetime import datetime
 from threading import Lock, Thread
+from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from ultralytics import YOLO
 
@@ -18,6 +19,7 @@ from src.features.pose_estimator import PoseEstimator
 from src.features.pose_features import PoseFeatureExtractor
 from src.ml.predict import AnomalyDetector
 from src.scene.appearance import detect_clothing_color
+from src.alerts.telegram_alert import send_telegram_alert
 
 SCORE_THRESHOLD = -0.1
 RISK_INC = 1.5
@@ -33,6 +35,7 @@ GESTURE_BONUS = 1.0
 
 MAX_EVENTS = int(os.getenv("CCTV_MAX_EVENTS", "40"))
 EVENT_INTERVAL = float(os.getenv("CCTV_EVENT_INTERVAL", "3.0"))
+FRAME_SKIP = max(1, int(os.getenv("CCTV_FRAME_SKIP", "2")))
 CAMERA_NAME = os.getenv("CCTV_CAMERA", "CAM-01")
 LOCATION_NAME = os.getenv("CCTV_LOCATION", "shop aisle")
 
@@ -72,7 +75,14 @@ IMPORTANT_OBJECTS = {
     74
 }
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker = Thread(target=_process_stream, daemon=True)
+    worker.start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -88,6 +98,8 @@ _last_emit = {}
 _last_status = {}
 _frame_lock = Lock()
 _latest_frame = None
+_report_lock = Lock()
+_latest_report = None
 _detections_lock = Lock()
 _latest_detections = []
 _metrics_lock = Lock()
@@ -148,13 +160,26 @@ def _score_to_risk(model_score: float | None, risk: float) -> float:
     return float(min(max(risk / (ALERT_RISK * 2.0), 0.0), 1.0))
 
 
-def _safe_explain(event: dict) -> str:
+def _safe_explain(event: dict) -> dict:
     try:
         from src.genai.explainer import explain_event
 
-        return explain_event(event)
+        result = explain_event(event)
+        if isinstance(result, dict):
+            return result
+        return {
+            "suspicious": False,
+            "threat_level": "LOW",
+            "explanation": "AI response was not JSON",
+            "alert_message": "No actionable threat detected"
+        }
     except Exception as exc:
-        return f"GenAI unavailable: {exc}"
+        return {
+            "suspicious": False,
+            "threat_level": "LOW",
+            "explanation": f"GenAI unavailable: {exc}",
+            "alert_message": "No actionable threat detected"
+        }
 
 
 def _parse_source(value: str | None):
@@ -217,6 +242,17 @@ def _get_metrics() -> dict:
         return dict(_latest_metrics)
 
 
+def _set_report(report: str) -> None:
+    global _latest_report
+    with _report_lock:
+        _latest_report = report
+
+
+def _get_report() -> str | None:
+    with _report_lock:
+        return _latest_report
+
+
 def _should_emit(track_id: int, status: str) -> bool:
     now = time.time()
     last_time = _last_emit.get(track_id, 0)
@@ -232,7 +268,7 @@ def _mark_emitted(track_id: int, status: str) -> None:
 
 
 def _build_behavior_chain(window_features: dict) -> list[str]:
-    chain = ["Entered aisle"]
+    chain = ["Entered"]
     if window_features.get("stop_mean", 0) > 10:
         chain.append("Stopped repeatedly")
     if window_features.get("angle_mean", 0) > 0.4:
@@ -240,7 +276,7 @@ def _build_behavior_chain(window_features: dict) -> list[str]:
     if window_features.get("hand_mean", 1.0) < 0.15:
         chain.append("Concealment gesture")
     if window_features.get("crouch_ratio", 0) > 0.5:
-        chain.append("Crouched near shelf")
+        chain.append("Crouched")
     if window_features.get("time_mean", 0) > 15:
         chain.append("Remained in zone")
     return chain
@@ -252,6 +288,20 @@ def _build_recommendation(risk_score: float) -> str:
     if risk_score >= 0.6:
         return "Monitor subject continuously and review prior frames."
     return "Continue observation and log activity for trend analysis."
+
+
+def _needs_suspicious_override(text: str | None) -> bool:
+    if not text:
+        return True
+    lowered = text.lower()
+    red_flags = [
+        "no suspicious",
+        "normal behavior",
+        "no actionable threat",
+        "low risk",
+        "no threat"
+    ]
+    return any(flag in lowered for flag in red_flags)
 
 
 def _process_stream() -> None:
@@ -286,6 +336,7 @@ def _process_stream() -> None:
 
     suspicion_history: dict[int, float] = {}
     crowd_history: list[int] = []
+    last_overlays: list[dict] = []
     frame_count = 0
     last_frame_time = time.time()
 
@@ -297,7 +348,46 @@ def _process_stream() -> None:
         frame_count += 1
         frame = cv2.resize(frame, (640, 360))
         display_frame = frame.copy()
-        if frame_count % 5 != 0:
+
+        if last_overlays:
+            for overlay in last_overlays:
+                color = overlay["color"]
+                x1, y1, x2, y2 = overlay["bbox"]
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    display_frame,
+                    overlay["label"],
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2
+                )
+                if overlay.get("suspicious"):
+                    cv2.putText(
+                        display_frame,
+                        "Suspicious",
+                        (x1, y2 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        color,
+                        1
+                    )
+                for point in overlay.get("pose", []):
+                    cv2.circle(display_frame, (point["x"], point["y"]), 3, (255, 0, 0), -1)
+
+        cv2.putText(
+            display_frame,
+            "GREEN: LOW | YELLOW: MED | RED: HIGH",
+            (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        _set_frame(display_frame)
+        if frame_count % FRAME_SKIP != 0:
             continue
 
         if is_frame_blurry(frame):
@@ -363,6 +453,7 @@ def _process_stream() -> None:
 
         detections_payload = []
         suspicious_count = 0
+        current_overlays: list[dict] = []
 
         for track in valid_tracks:
             track_id = int(track.track_id)
@@ -414,28 +505,15 @@ def _process_stream() -> None:
                     suspicious_count += 1
 
                 color = (0, 255, 0) if risk < RISK_LOW else (0, 255, 255) if risk < RISK_MID else (0, 0, 255)
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(
-                    display_frame,
-                    f"ID:{track_id} {level} ({risk:.1f})",
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    2
+                current_overlays.append(
+                    {
+                        "bbox": (x1, y1, x2, y2),
+                        "color": color,
+                        "label": f"ID:{track_id} {level} ({risk:.1f})",
+                        "suspicious": status == "suspicious",
+                        "pose": pose_points
+                    }
                 )
-                if status == "suspicious":
-                    cv2.putText(
-                        display_frame,
-                        "Suspicious",
-                        (x1, y2 + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        color,
-                        1
-                    )
-                for point in pose_points:
-                    cv2.circle(display_frame, (point["x"], point["y"]), 3, (255, 0, 0), -1)
 
                 detections_payload.append(
                     {
@@ -519,33 +597,22 @@ def _process_stream() -> None:
             else:
                 level = "HIGH"
 
-            status = "suspicious" if risk >= ALERT_RISK else "normal"
+            is_suspicious = risk >= ALERT_RISK
+            status = "suspicious" if is_suspicious else "normal"
+            print(f"[DEBUG] Track:{track_id} Risk:{risk:.2f} Status:{status}")
             if status == "suspicious":
                 suspicious_count += 1
 
             color = (0, 255, 0) if risk < RISK_LOW else (0, 255, 255) if risk < RISK_MID else (0, 0, 255)
-            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                display_frame,
-                f"ID:{track_id} {level} ({risk:.1f})",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
+            current_overlays.append(
+                {
+                    "bbox": (x1, y1, x2, y2),
+                    "color": color,
+                    "label": f"ID:{track_id} {level} ({risk:.1f})",
+                    "suspicious": status == "suspicious",
+                    "pose": pose_points
+                }
             )
-            if status == "suspicious":
-                cv2.putText(
-                    display_frame,
-                    "Suspicious",
-                    (x1, y2 + 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    color,
-                    1
-                )
-            for point in pose_points:
-                cv2.circle(display_frame, (point["x"], point["y"]), 3, (255, 0, 0), -1)
 
             risk_score = _score_to_risk(model_score, risk)
             detections_payload.append(
@@ -563,23 +630,17 @@ def _process_stream() -> None:
                 }
             )
 
-            if status != "suspicious":
-                continue
-            if not _should_emit(track_id, status):
+            if not is_suspicious:
                 continue
 
             reason = _build_reason(window_features)
-            # alert = _build_alert(risk_score)
-            alert = (
-                    f"⚠️ Suspicious behavior detected: "
-                    f"Person wearing {shirt_color} clothing "
-                    f"showing unusual movement, repeated activity, "
-                    f"or concealment-like behavior."
-                )
+            if reason == "no clear suspicious behaviors":
+                reason = "Multiple suspicious activity patterns detected"
+            alert = _build_alert(risk_score)
             behavior_chain = _build_behavior_chain(window_features)
             recommendation = _build_recommendation(risk_score)
 
-            explanation = _safe_explain(
+            ai_result = _safe_explain(
                 {
                     "person_id": track_id,
                     "loitering": window_features.get("time_mean", 0) > 15,
@@ -592,6 +653,23 @@ def _process_stream() -> None:
                     "location": LOCATION_NAME
                 }
             )
+            explanation = ai_result.get("explanation", "")
+            if _needs_suspicious_override(explanation):
+                explanation = (
+                    f"Behavioral anomalies observed: {reason}. "
+                    f"Crowd density {crowd_density}. "
+                    f"Risk score {round(risk_score * 100, 1)}%."
+                )
+
+            alert_message = ai_result.get("alert_message", "")
+            if _needs_suspicious_override(alert_message):
+                alert_message = (
+                    f"Suspicious activity detected. Verify subject {track_id} on {CAMERA_NAME}."
+                )
+            alert = alert_message
+
+            if not _should_emit(track_id, status):
+                continue
 
             event = {
                 "id": int(time.time() * 1000),
@@ -607,19 +685,24 @@ def _process_stream() -> None:
                 "recommendation": recommendation
             }
 
+            from src.clips.clip_saver import save_clip
+            from src.reports.incident_report import generate_report
+
+            clip_path = save_clip(display_frame, track_id)
+            event["clip"] = clip_path
+
+            report = generate_report(event)
+            print(report)
+            _set_report(report)
+
             _push_event(event)
+            from src.memory.event_store import store_event
+
+            store_event(event)
+            send_telegram_alert(alert)
             _mark_emitted(track_id, status)
             _set_frame(display_frame)
 
-        cv2.putText(
-            display_frame,
-            "GREEN: LOW | YELLOW: MED | RED: HIGH",
-            (10, 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1
-        )
         _set_detections(detections_payload)
         _set_metrics(
             {
@@ -629,16 +712,9 @@ def _process_stream() -> None:
                 "camera_count": 1
             }
         )
-
-        _set_frame(display_frame)
+        last_overlays = current_overlays
 
     cap.release()
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    worker = Thread(target=_process_stream, daemon=True)
-    worker.start()
 
 
 @app.get("/api/health")
@@ -649,6 +725,8 @@ def health() -> dict:
 @app.get("/api/events")
 def get_events() -> dict:
     latest = _get_latest_event()
+    if latest and "explanation" not in latest:
+        latest["explanation"] = "Analysis pending..."
     events = _get_events()
     detections = _get_detections()
     metrics = _get_metrics()
@@ -684,43 +762,48 @@ def stream() -> StreamingResponse:
     )
 
 
+@app.get("/api/report/latest")
+def latest_report() -> Response:
+    report = _get_report()
+    if not report:
+        return Response(status_code=404, content="No report available.")
+
+    from io import BytesIO
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    y = height - 72
+    for line in report.splitlines():
+        pdf.drawString(72, y, line)
+        y -= 14
+        if y < 72:
+            pdf.showPage()
+            y = height - 72
+    pdf.save()
+
+    buffer.seek(0)
+    return Response(
+        content=buffer.read(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=incident_report.pdf"}
+    )
+
+
 @app.post("/api/chat")
 def chat(request: ChatRequest) -> dict:
+    from src.genai.chat_agent import answer_question
+
+    answer = answer_question(request.question)
+
     latest = _get_latest_event()
-    if not latest:
-        return {"answer": "No active events yet. The system is still warming up."}
-
-    question = request.question.strip().lower()
-    if not question:
-        return {"answer": "Please ask a question about the current feed."}
-
-    if "why" in question or "flagged" in question:
-        answer = (
-            f"Person {latest['person_id']} was flagged because the model detected {latest['reason']}. "
-            f"Confidence is {round(latest['risk_score'] * 100)}%, with status: {latest['status'].upper()}."
-        )
-    elif "last" in question or "event" in question:
-        answer = (
-            f"Last event: {latest['alert']} at {latest['timestamp']}. "
-            f"Explanation: {latest['explanation']}"
-        )
-    elif "risk" in question or "level" in question:
-        answer = (
-            f"Current threat level is {_risk_label(latest['risk_score']).upper()}. "
-            f"Highest active subject is Person {latest['person_id']} with {round(latest['risk_score'] * 100)}% risk."
-        )
-    else:
-        answer = (
-            f"Latest feed intelligence: Person {latest['person_id']}, {round(latest['risk_score'] * 100)}% risk, "
-            f"reason: {latest['reason']}."
-        )
-    threat_level = _risk_label(latest["risk_score"]).upper()
-    recommendation = latest.get("recommendation") or _build_recommendation(latest["risk_score"])
+    if latest and "explanation" not in latest:
+        latest["explanation"] = "Analysis pending..."
 
     return {
-        "answer": answer,
-        "threat_level": threat_level,
-        "recommendation": recommendation
+        "answer": answer
     }
 
 

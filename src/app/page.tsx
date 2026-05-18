@@ -12,7 +12,6 @@ import {
   LockKeyhole,
   MessageSquareText,
   Send,
-  ShieldAlert,
   ShieldCheck,
   Siren,
   Sparkles,
@@ -65,7 +64,10 @@ function riskLabel(score: number) {
   return "Low";
 }
 
-function cleanText(value: string) {
+function cleanText(value: unknown) {
+  if (typeof value !== "string") {
+    return "";
+  }
   return value.replace(/\*\*/g, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -74,6 +76,12 @@ function answerQuestion(question: string, latestEvent: SecurityEvent | null) {
     return "No suspicious activity detected yet.";
   }
   const q = question.toLowerCase();
+
+  if (q.includes("show last suspicious event") || q.includes("last suspicious event") || q.includes("incident report")) {
+    return `INCIDENT REPORT\n-----------------------\n\nTime: ${latestEvent.timestamp}\nCamera: ${latestEvent.camera}\nPerson ID: ${latestEvent.person_id}\nThreat Level: ${latestEvent.status.toUpperCase()}\nRisk Score: ${Math.round(
+      latestEvent.risk_score * 100
+    )}%\n\nReason:\n${latestEvent.reason}\n\nAI Explanation:\n${latestEvent.explanation}\n\nAlert Message:\n${latestEvent.alert}\n\nRecommendation:\n${latestEvent.recommendation ?? ""}`.trim();
+  }
 
   if (q.includes("why") || q.includes("flagged")) {
     return `Person ${latestEvent.person_id} was flagged because the model detected ${latestEvent.reason}. Confidence is ${Math.round(
@@ -107,8 +115,6 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [toastEvent, setToastEvent] = useState<SecurityEvent | null>(null);
-  const [lastToastId, setLastToastId] = useState<number | null>(null);
   const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
   const latestEvent = events[0] ?? null;
@@ -126,10 +132,13 @@ export default function DashboardPage() {
         if (!isActive) return;
 
         const incoming = Array.isArray(payload?.events) ? payload.events : [];
-        if (incoming.length > 0) {
-          setEvents(incoming);
-        } else if (payload?.latest_event) {
+        const suspiciousIncoming = incoming.filter((event) => event.status === "suspicious");
+        if (suspiciousIncoming.length > 0) {
+          setEvents(suspiciousIncoming);
+        } else if (payload?.latest_event?.status === "suspicious") {
           setEvents([payload.latest_event]);
+        } else {
+          setEvents([]);
         }
 
         if (payload?.metrics) {
@@ -147,21 +156,6 @@ export default function DashboardPage() {
       window.clearInterval(timer);
     };
   }, [apiBase]);
-
-  useEffect(() => {
-    if (!events.length) return;
-    const newest = events[0];
-    if (newest.status === "suspicious" && newest.id !== lastToastId) {
-      setToastEvent(newest);
-      setLastToastId(newest.id);
-    }
-  }, [events, lastToastId]);
-
-  useEffect(() => {
-    if (!toastEvent) return;
-    const timer = window.setTimeout(() => setToastEvent(null), 4200);
-    return () => window.clearTimeout(timer);
-  }, [toastEvent]);
 
   async function submitQuestion(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -209,10 +203,10 @@ export default function DashboardPage() {
   return (
     <main className="control-grid relative min-h-screen overflow-hidden bg-[#020617] px-4 py-4 text-slate-100 sm:px-6 lg:px-8">
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,rgba(255,255,255,0.04),transparent_16%,transparent_84%,rgba(39,232,255,0.05))]" />
-      <div className="relative mx-auto flex max-w-[1800px] flex-col gap-4">
+      <div className="relative mx-auto flex max-w-[2000px] flex-col gap-4">
         <TopStatusBar threatLevel={threatLevel} isSuspicious={isSuspicious} metrics={metrics} />
 
-        <section className="grid h-auto grid-cols-1 gap-4 xl:h-[calc(100vh-116px)] xl:grid-cols-[1.4fr_0.88fr_0.92fr]">
+        <section className="grid h-auto grid-cols-1 gap-4 xl:h-[calc(100vh-116px)] xl:grid-cols-[1.8fr_0.7fr_0.7fr]">
           <CameraPanel
             apiBase={apiBase}
             latestEvent={latestEvent}
@@ -229,9 +223,6 @@ export default function DashboardPage() {
         </section>
       </div>
 
-      <AnimatePresence>
-        {toastEvent && <AlertToast event={toastEvent} />}
-      </AnimatePresence>
     </main>
   );
 }
@@ -256,8 +247,8 @@ function TopStatusBar({
           <ShieldCheck className="h-5 w-5 text-cyan-200" />
         </div>
         <div>
-          <h1 className="text-lg font-semibold tracking-[0.12em] text-white sm:text-xl">CCTV AI MONITOR</h1>
-          <p className="font-mono text-xs uppercase tracking-[0.16em] text-cyan-200/70">Single live feed / AI risk review</p>
+          <h1 className="text-xl font-semibold tracking-[0.12em] text-white sm:text-2xl">CCTV AI MONITOR</h1>
+          <p className="font-mono text-sm uppercase tracking-[0.16em] text-cyan-200/80">Single live feed / AI risk review</p>
         </div>
       </div>
 
@@ -295,8 +286,8 @@ function StatusPill({
     <div className={`flex items-center gap-2 rounded-md border px-3 py-2 ${color}`}>
       <span className="h-4 w-4 [&>svg]:h-4 [&>svg]:w-4">{icon}</span>
       <div>
-        <p className="text-[10px] uppercase tracking-[0.18em] opacity-65">{label}</p>
-        <p className="font-mono text-sm font-semibold">{value}</p>
+        <p className="text-[11px] uppercase tracking-[0.18em] opacity-70">{label}</p>
+        <p className="font-mono text-base font-semibold">{value}</p>
       </div>
     </div>
   );
@@ -331,7 +322,7 @@ function CameraPanel({
         <img
           src={`${apiBase}/api/stream`}
           alt="Live CCTV stream"
-          className="absolute inset-0 h-full w-full object-cover opacity-85"
+          className="absolute inset-0 h-full w-full object-contain opacity-95"
           loading="eager"
         />
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_24%,rgba(79,140,255,0.24),transparent_24rem),linear-gradient(145deg,#07111f,#101827_44%,#070b14)] opacity-40" />
@@ -381,8 +372,8 @@ function CameraPanel({
 function CameraMetric({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
   return (
     <div className={`rounded-md border px-3 py-2 backdrop-blur ${danger ? "border-amber-300/40 bg-amber-400/10 text-amber-100" : "border-cyan-300/20 bg-black/30 text-cyan-100"}`}>
-      <p className="font-mono text-[10px] uppercase tracking-[0.2em] opacity-60">{label}</p>
-      <p className="mt-1 text-lg font-semibold capitalize">{value}</p>
+      <p className="font-mono text-[11px] uppercase tracking-[0.2em] opacity-70">{label}</p>
+      <p className="mt-1 text-xl font-semibold capitalize">{value}</p>
     </div>
   );
 }
@@ -390,8 +381,8 @@ function CameraMetric({ label, value, danger = false }: { label: string; value: 
 function SummaryTile({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
   return (
     <div className={`rounded-md border px-3 py-3 ${danger ? "border-amber-300/30 bg-amber-400/10 text-amber-100" : "border-slate-600/50 bg-white/5 text-slate-100"}`}>
-      <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">{label}</p>
-      <p className="mt-1 line-clamp-1 text-sm font-medium capitalize">{value}</p>
+      <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">{label}</p>
+      <p className="mt-1 line-clamp-1 text-base font-medium capitalize">{value}</p>
     </div>
   );
 }
@@ -399,6 +390,7 @@ function SummaryTile({ label, value, danger = false }: { label: string; value: s
 function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
   const suspiciousEvents = events.filter((event) => event.status === "suspicious");
   const genaiEvent = suspiciousEvents[0] ?? null;
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
   return (
     <motion.section
@@ -414,7 +406,17 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
           <div className="mt-4 rounded-lg border border-amber-300/30 bg-amber-400/10 p-4 shadow-[0_18px_50px_rgba(251,191,36,0.12)]">
             <div className="flex items-center gap-2 text-amber-100">
               <Siren className="h-5 w-5" />
-              <p className="text-sm font-semibold uppercase tracking-[0.2em]">Real-time Alerts Feed</p>
+              <p className="text-base font-semibold uppercase tracking-[0.2em]">Real-time Alerts Feed</p>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <p className="text-sm text-amber-100/70">Report ready for latest alert.</p>
+              <button
+                type="button"
+                onClick={() => window.open(`${apiBase}/api/report/latest`, "_blank")}
+                className="rounded-md border border-amber-300/40 bg-amber-400/15 px-3 py-2 text-sm font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/25"
+              >
+                Download report (PDF)
+              </button>
             </div>
             <div className="mt-4 max-h-56 space-y-3 overflow-y-auto pr-1">
               <AnimatePresence initial={false}>
@@ -427,12 +429,12 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
                     className="rounded-md border border-amber-300/40 bg-amber-400/10 p-3"
                   >
                     <div className="flex items-center justify-between gap-3">
-                      <span className="font-mono text-xs text-slate-300">{event.timestamp}</span>
-                      <span className="rounded-sm bg-amber-300/20 px-2 py-1 font-mono text-[10px] uppercase text-amber-100">
+                      <span className="font-mono text-sm text-slate-300">{event.timestamp}</span>
+                      <span className="rounded-sm bg-amber-300/20 px-2 py-1 font-mono text-[11px] uppercase text-amber-100">
                         Person {event.person_id}
                       </span>
                     </div>
-                    <p className="mt-2 whitespace-pre-line text-sm text-slate-100">{cleanText(event.explanation)}</p>
+                    <p className="mt-2 whitespace-pre-line text-base text-slate-100">{cleanText(event.explanation)}</p>
                   </motion.article>
                 ))}
               </AnimatePresence>
@@ -450,11 +452,11 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Sparkles className="h-5 w-5 text-amber-200" />
-                  <p className="text-sm font-semibold uppercase tracking-[0.2em]">GenAI Explanation</p>
+                  <p className="text-base font-semibold uppercase tracking-[0.2em]">AI Explanation</p>
                 </div>
-                <span className="font-mono text-xs text-slate-300">{genaiEvent.timestamp}</span>
+                <span className="font-mono text-sm text-slate-300">{genaiEvent.timestamp}</span>
               </div>
-              <p className="mt-4 whitespace-pre-line text-lg leading-7 text-white">{cleanText(genaiEvent.explanation)}</p>
+              <p className="mt-4 whitespace-pre-line text-xl leading-8 text-white">{cleanText(genaiEvent.explanation)}</p>
               <div className="mt-4 grid grid-cols-3 gap-2">
                 <InsightMetric label="Risk" value={`${Math.round(genaiEvent.risk_score * 100)}%`} />
                 <InsightMetric label="Signal" value={genaiEvent.reason} />
@@ -463,7 +465,7 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
               {Array.isArray(genaiEvent.behavior_chain) && genaiEvent.behavior_chain.length > 0 && (
                 <div className="mt-4 space-y-2">
                   {genaiEvent.behavior_chain.map((step, index) => (
-                    <div key={`${genaiEvent.id}-step-${index}`} className="rounded-md border border-white/10 bg-black/20 px-3 py-2 text-sm text-slate-200">
+                    <div key={`${genaiEvent.id}-step-${index}`} className="rounded-md border border-white/10 bg-black/20 px-3 py-2 text-base text-slate-200">
                       {index + 1}. {step}
                     </div>
                   ))}
@@ -476,7 +478,7 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
 
       {suspiciousEvents.length > 0 && (
         <div className="mt-4 rounded-lg border border-amber-300/20 bg-black/20 p-4">
-          <p className="text-xs uppercase tracking-[0.18em] text-amber-200">Activity Timeline</p>
+          <p className="text-sm uppercase tracking-[0.18em] text-amber-200">Activity Timeline</p>
           <div className="mt-4 space-y-3">
             {suspiciousEvents.slice(0, 5).map((event) => (
               <div
@@ -484,10 +486,10 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
                 className="flex items-center justify-between rounded-md border border-white/10 bg-white/5 px-3 py-2"
               >
                 <div>
-                  <p className="text-sm text-white">Person {event.person_id}</p>
-                  <p className="text-xs text-slate-400">{event.reason}</p>
+                  <p className="text-base text-white">Person {event.person_id}</p>
+                  <p className="text-sm text-slate-400">{event.reason}</p>
                 </div>
-                <span className="text-xs font-semibold text-amber-200">
+                <span className="text-sm font-semibold text-amber-200">
                   {Math.round(event.risk_score * 100)}%
                 </span>
               </div>
@@ -502,8 +504,8 @@ function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
 function InsightMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-md border border-white/10 bg-black/20 p-2">
-      <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-slate-400">{label}</p>
-      <p className="mt-1 line-clamp-2 text-xs text-slate-100">{value}</p>
+      <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-slate-300">{label}</p>
+      <p className="mt-1 line-clamp-2 text-sm text-slate-100">{value}</p>
     </div>
   );
 }
@@ -521,7 +523,14 @@ function AssistantPanel({
   onInput: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const prompts = ["Why was Person 2 flagged?", "Show last suspicious event", "What is current risk level?"];
+  const prompts = [
+    "Why was Person 2 flagged?",
+    "Show last suspicious event",
+    "What is current risk level?",
+    "List suspicious events from last 10 minutes",
+    "What is the latest alert message?",
+    "Which camera is active?"
+  ];
 
   return (
     <motion.section
@@ -538,7 +547,7 @@ function AssistantPanel({
             key={prompt}
             type="button"
             onClick={() => onInput(prompt)}
-            className="whitespace-nowrap rounded-md border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-xs text-cyan-100 transition hover:border-cyan-200/60 hover:bg-cyan-300/20"
+            className="whitespace-nowrap rounded-md border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-sm text-cyan-100 transition hover:border-cyan-200/60 hover:bg-cyan-300/20"
           >
             {prompt}
           </button>
@@ -560,7 +569,7 @@ function AssistantPanel({
                 </div>
               )}
               <div
-                className={`max-w-[84%] rounded-lg border px-3 py-2 text-sm leading-6 ${
+                className={`max-w-[84%] whitespace-pre-line rounded-lg border px-3 py-2 text-base leading-7 ${
                   message.role === "user"
                     ? "border-blue-300/30 bg-blue-500/15 text-blue-50"
                     : "border-cyan-300/25 bg-cyan-400/10 text-slate-100 shadow-cyan"
@@ -568,7 +577,7 @@ function AssistantPanel({
               >
                 {cleanText(message.text)}
                 {message.role === "ai" && message.recommendation && (
-                  <div className="mt-2 rounded-md border border-red-300/20 bg-red-500/10 p-2 text-xs text-red-100">
+                  <div className="mt-2 rounded-md border border-red-300/20 bg-red-500/10 p-2 text-sm text-red-100">
                     Recommendation: {message.recommendation}
                   </div>
                 )}
@@ -599,14 +608,14 @@ function AssistantPanel({
           value={input}
           onChange={(event) => onInput(event.target.value)}
           placeholder="Ask the AI security assistant..."
-          className="min-w-0 flex-1 rounded-md border border-cyan-300/20 bg-cyan-300/10 px-3 py-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200/70 focus:shadow-cyan"
+          className="min-w-0 flex-1 rounded-md border border-cyan-300/20 bg-cyan-300/10 px-3 py-3 text-base text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200/70 focus:shadow-cyan"
         />
         <button
           type="submit"
           className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md border border-cyan-300/40 bg-cyan-300/15 text-cyan-100 transition hover:bg-cyan-300/25 hover:shadow-cyan"
           aria-label="Send question"
         >
-          <Send className="h-4 w-4" />
+          <Send className="h-5 w-5" />
         </button>
       </form>
     </motion.section>
@@ -631,8 +640,8 @@ function PanelTitle({
           {icon}
         </div>
         <div>
-          <h2 className={`${compact ? "text-sm" : "text-base"} font-semibold uppercase tracking-[0.18em] text-white`}>{title}</h2>
-          <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-slate-400">{subtitle}</p>
+          <h2 className={`${compact ? "text-base" : "text-lg"} font-semibold uppercase tracking-[0.18em] text-white`}>{title}</h2>
+          <p className="font-mono text-[12px] uppercase tracking-[0.18em] text-slate-300">{subtitle}</p>
         </div>
       </div>
       {!compact && <Eye className="h-5 w-5 text-cyan-200/70" />}
@@ -640,23 +649,3 @@ function PanelTitle({
   );
 }
 
-function AlertToast({ event }: { event: SecurityEvent }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, x: 80 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 80 }}
-      className="fixed right-4 top-24 z-50 w-[min(420px,calc(100vw-2rem))] rounded-lg border border-amber-300/40 bg-gradient-to-br from-amber-500/80 to-yellow-900/90 p-4 shadow-[0_18px_50px_rgba(251,191,36,0.35)] backdrop-blur-xl"
-    >
-      <div className="flex gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-amber-100/30 bg-white/10">
-          <ShieldAlert className="h-5 w-5 text-amber-50" />
-        </div>
-        <div>
-          <p className="font-semibold text-white">Suspicious Activity Detected</p>
-          <p className="mt-1 whitespace-pre-line text-sm leading-6 text-amber-50/90">{cleanText(event.explanation)}</p>
-        </div>
-      </div>
-    </motion.div>
-  );
-}

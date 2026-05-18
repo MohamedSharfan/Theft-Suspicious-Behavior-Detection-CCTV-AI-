@@ -18,15 +18,15 @@ def build_prompt(event):
         behaviors.append("possible concealment hand motion")
 
     if behaviors:
-        behavior_text = ", ".join(behaviors)
+        behavior_text = "multiple suspicious movement patterns detected"
     else:
-        behavior_text = "no clear suspicious behaviors detected"
+        behavior_text = "normal behavior observed"
 
     return f"""
     CCTV INCIDENT EVENT
 
     ENVIRONMENT:
-    Location Type: {event.get("location", "unknown")}
+    Location Type: general indoor area
 
     PERSON DETAILS:
     Person ID: {event.get("person_id", "unknown")}
@@ -53,17 +53,20 @@ def build_prompt(event):
     - Consider retail shoplifting patterns
     - Standing alone is NOT suspicious
     - Loitering alone is NOT enough for theft suspicion
-    - Add a few relevant stickers/emojis in the response to improve readability
+    - Avoid specific place references (aisle, shelf, register)
 
-    REQUIRED RESPONSE FORMAT:
+    REQUIRED RESPONSE FORMAT (STRICT JSON):
 
-    Suspicious: YES or NO
+    {{
+        "suspicious": true,
+        "threat_level": "HIGH",
+        "explanation": "short behavioral explanation in 1-2 lines",
+        "alert_message": "short operator alert (max 20 words)"
+    }}
 
-    Threat Level: LOW / MEDIUM / HIGH
-
-    Explanation:
-    Explain why the behavior may or may not be suspicious.
-
-    Alert Message:
-    Write a professional CCTV operator alert under 25 words.
+    IMPORTANT:
+    - suspicious must be true or false only
+    - Return ONLY JSON
+    - No markdown
+    - No extra text
     """
