@@ -79,6 +79,19 @@ function cleanText(value: unknown) {
   return value.replace(/\*\*/g, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function normalizeApiBase(value: string) {
+  const trimmed = value.replace(/\/+$/, "");
+  const match = trimmed.match(/^https:\/\/huggingface\.co\/spaces\/([^/]+)\/([^/]+)$/i);
+
+  if (!match) {
+    return trimmed;
+  }
+
+  const owner = match[1].toLowerCase();
+  const space = match[2].toLowerCase();
+  return `https://${owner}-${space}.hf.space`;
+}
+
 function answerQuestion(question: string, latestEvent: SecurityEvent | null) {
   if (!latestEvent) {
     return "No suspicious activity detected yet.";
@@ -126,7 +139,7 @@ export default function DashboardPage() {
   const [frameDetections, setFrameDetections] = useState<FrameDetection[]>([]);
   const [webcamStatus, setWebcamStatus] = useState("Starting webcam...");
   const videoRef = useRef<HTMLVideoElement>(null);
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+  const apiBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000");
 
   const latestEvent = events[0] ?? null;
   const isSuspicious = latestEvent?.status === "suspicious";
@@ -502,7 +515,7 @@ function SummaryTile({ label, value, danger = false }: { label: string; value: s
 function AnalysisPanel({ events }: { events: SecurityEvent[] }) {
   const suspiciousEvents = events.filter((event) => event.status === "suspicious");
   const genaiEvent = suspiciousEvents[0] ?? null;
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+  const apiBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000");
 
   return (
     <motion.section
