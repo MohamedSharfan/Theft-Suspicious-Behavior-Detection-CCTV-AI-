@@ -12,3 +12,6 @@ torchvision
 torchaudio
 mediapipe==0.10.14
 protobuf
+groq
+fastapi
+uvicorn

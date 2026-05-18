@@ -37,7 +37,7 @@ class PoseFeatureExtractor:
         if len(person["shoulder_width"]) > 10:
             person["shoulder_width"].pop(0)
 
-        body_expension = np.mean(person["shoulder_width"])
+        body_expansion = np.mean(person["shoulder_width"])
 
 
 
@@ -64,11 +64,20 @@ class PoseFeatureExtractor:
             lw_speed = np.linalg.norm(lw_curr - lw_prev)
             rw_speed = np.linalg.norm(rw_curr - rw_prev)
 
-            wrist_speed = (lw_speed + rw_speed) / 2
+            raw_wrist_speed = (lw_speed + rw_speed) / 2
+            if "wrist_speeds" not in person:
+                person["wrist_speeds"] = []
+            #sliding window to reduce the auto widing size
+            person["wrist_speeds"].append(raw_wrist_speed)
+            if len(person["wrist_speeds"]) > 5:
+                person["wrist_speeds"].pop(0)
+
+            wrist_speed = np.mean(person["wrist_speeds"])
+
 
             return{
-                "wrist_speed": float(wrist_speed),
-                "body_expension": float(body_expension)
+                "hand_speed": float(wrist_speed),
+                "body_expansion": float(body_expansion)
             }  
 
 

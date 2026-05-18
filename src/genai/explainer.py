@@ -24,8 +24,27 @@ def explain_event(event):
         response = client.chat.completions.create(
             model = "llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": "You are a CCTV security analyst AI."},
-                {"role": "user", "content": f"Gen AI is analyzing: {prompt}"}
+                {"role": "system",
+                "content": """
+                            You are an advanced CCTV forensic AI specialized in:
+                            - retail theft analysis
+                            - suspicious behavior detection
+                            - violence detection
+                            - surveillance reasoning
+
+                            Your job is to analyze structured CCTV behavior events.
+
+                            Rules:
+                            - Avoid false accusations
+                            - Not all loitering is suspicious
+                            - Standing still alone is normal in many environments
+                            - Use environmental context carefully
+                            - Be professional and realistic
+                            - Focus on behavioral patterns over time
+
+                            Your responses must sound like a real security monitoring system.
+                            """},
+                {"role": "user", "content": prompt}
             ],
             temperature = 0.3
         )
