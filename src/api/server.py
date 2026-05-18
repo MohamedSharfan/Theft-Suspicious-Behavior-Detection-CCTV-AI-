@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 import cv2
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
@@ -77,8 +77,9 @@ IMPORTANT_OBJECTS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    worker = Thread(target=_process_stream, daemon=True)
-    worker.start()
+    if os.getenv("CLOUD", "").lower() != "true":
+        worker = Thread(target=_process_stream, daemon=True)
+        worker.start()
     yield
 
 
@@ -109,6 +110,8 @@ _latest_metrics = {
     "fps": 0.0,
     "camera_count": 1
 }
+_frame_model = None
+_frame_model_lock = Lock()
 
 
 class ChatRequest(BaseModel):
@@ -117,6 +120,16 @@ class ChatRequest(BaseModel):
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _get_frame_model():
+    global _frame_model
+    with _frame_model_lock:
+        if _frame_model is None:
+            model_path = os.getenv("CCTV_MODEL_PATH", "yolov8n.pt")
+            _frame_model = YOLO(model_path)
+            _frame_model.to("cpu")
+        return _frame_model
 
 
 def _risk_label(score: float) -> str:
@@ -305,6 +318,9 @@ def _needs_suspicious_override(text: str | None) -> bool:
 
 
 def _process_stream() -> None:
+    if os.getenv("CLOUD", "").lower() == "true":
+        return
+
     model_path = os.getenv("CCTV_MODEL_PATH", "yolov8n.pt")
     source = _parse_source(os.getenv("CCTV_SOURCE"))
 
@@ -720,6 +736,53 @@ def _process_stream() -> None:
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.post("/api/frame")
+async def process_frame(file: UploadFile = File(...)) -> dict:
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty frame upload.")
+
+    np_arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image frame.")
+
+    model = _get_frame_model()
+    results = model(frame)
+
+    detections = []
+    for result in results:
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+
+            if class_id != 0 or confidence < 0.5:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            detections.append(
+                {
+                    "x": x1,
+                    "y": y1,
+                    "w": max(0, x2 - x1),
+                    "h": max(0, y2 - y1),
+                    "confidence": confidence
+                }
+            )
+
+    _set_metrics(
+        {
+            "subjects": len(detections),
+            "suspicious": 0,
+            "fps": 0.0,
+            "camera_count": 1
+        }
+    )
+    _set_detections(detections)
+
+    return {"detections": detections}
 
 
 @app.get("/api/events")
