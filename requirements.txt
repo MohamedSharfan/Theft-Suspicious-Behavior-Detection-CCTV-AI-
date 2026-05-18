@@ -1,12 +1,14 @@
-opencv-python
+opencv-python-headless
 ultralytics
 deep-sort-realtime
 matplotlib
 numpy
+pillow
 pandas
 scikit-learn
 scipy
 python-dotenv
+google-generativeai
 torch
 torchvision
 torchaudio
