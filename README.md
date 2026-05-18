@@ -1,3 +1,13 @@
+---
+title: Theft Suspicious Behavior Detection CCTV AI
+emoji: 🛡️
+colorFrom: blue
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 ## Python AI pipeline
 
 ```bash
