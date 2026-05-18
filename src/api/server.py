@@ -121,6 +121,21 @@ class ChatRequest(BaseModel):
     question: str
 
 
+class _FrameTrack:
+    def __init__(self, track_id: int, bbox: list[int], confidence: float):
+        x, y, w, h = bbox
+        self.track_id = track_id
+        self.det_conf = confidence
+        self.time_since_update = 0
+        self._ltrb = (x, y, x + w, y + h)
+
+    def is_confirmed(self) -> bool:
+        return True
+
+    def to_ltrb(self):
+        return self._ltrb
+
+
 def _now_stamp() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -188,17 +203,50 @@ def _get_frame_pipeline() -> dict:
     global _frame_pipeline
     with _frame_pipeline_lock:
         if _frame_pipeline is None:
+            try:
+                detector = AnomalyDetector()
+            except Exception as exc:
+                print(f"[WARN] Anomaly model unavailable for frame API: {exc}")
+                detector = None
+
+            try:
+                pose_estimator = PoseEstimator()
+            except Exception as exc:
+                print(f"[WARN] Pose estimator unavailable for frame API: {exc}")
+                pose_estimator = None
+
+            try:
+                tracker = DeepSort(max_age=45, n_init=2, nn_budget=200)
+            except Exception as exc:
+                print(f"[WARN] DeepSORT unavailable for frame API: {exc}")
+                tracker = None
+
             _frame_pipeline = {
-                "tracker": DeepSort(max_age=45, n_init=2, nn_budget=200),
+                "tracker": tracker,
                 "extractor": FeatureExtractor(),
-                "detector": AnomalyDetector(),
-                "pose_estimator": PoseEstimator(),
+                "detector": detector,
+                "pose_estimator": pose_estimator,
                 "pose_extractor": PoseFeatureExtractor(),
                 "suspicion_history": {},
                 "crowd_history": [],
                 "last_frame_time": time.time()
             }
         return _frame_pipeline
+
+
+def _heuristic_suspicion(window_features: dict) -> bool:
+    signals = 0
+    if window_features.get("time_mean", 0) > 15:
+        signals += 1
+    if window_features.get("angle_mean", 0) > 0.4:
+        signals += 1
+    if window_features.get("stop_mean", 0) > 10:
+        signals += 1
+    if window_features.get("crouch_ratio", 0) > 0.5:
+        signals += 1
+    if window_features.get("hand_speed", 0) > HAND_SPEED_THRESH:
+        signals += 1
+    return signals >= 2
 
 
 def _safe_explain(event: dict) -> dict:
@@ -802,7 +850,13 @@ async def process_frame(file: UploadFile = File(...)) -> dict:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             raw_detections.append(([x1, y1, max(0, x2 - x1), max(0, y2 - y1)], confidence, "person"))
 
-    tracks = tracker.update_tracks(raw_detections, frame=frame)
+    if tracker is not None:
+        tracks = tracker.update_tracks(raw_detections, frame=frame)
+    else:
+        tracks = [
+            _FrameTrack(index + 1, bbox, confidence)
+            for index, (bbox, confidence, _) in enumerate(raw_detections)
+        ]
     valid_tracks = [
         track
         for track in tracks
@@ -860,7 +914,7 @@ async def process_frame(file: UploadFile = File(...)) -> dict:
 
         person_crop = frame[y1:y2, x1:x2]
         pose_landmarks = None
-        if person_crop.size:
+        if person_crop.size and pose_estimator is not None:
             try:
                 pose_landmarks = pose_estimator.estimate(person_crop)
             except Exception:
@@ -893,33 +947,39 @@ async def process_frame(file: UploadFile = File(...)) -> dict:
             window_features["crowd_std_30"] = crowd_std_30
 
             is_model_suspicious = None
-            try:
-                X = np.array([[
-                    window_features["speed_mean"],
-                    window_features["speed_std"],
-                    window_features["angle_mean"],
-                    window_features["angle_std"],
-                    window_features["acc_mean"],
-                    window_features["acc_std"],
-                    window_features["time_mean"],
-                    window_features["hand_mean"],
-                    window_features["hand_std"],
-                    window_features["stop_mean"],
-                    window_features["stop_std"],
-                    window_features["crouch_ratio"],
-                    window_features["hand_speed"],
-                    window_features["body_expansion"],
-                    window_features["crowd_count"],
-                    window_features["crowd_density_ratio"],
-                    window_features["avg_person_distance"],
-                    window_features["crowd_mean_30"],
-                    window_features["crowd_std_30"]
-                ]])
-                X_scaled = detector.scaler.transform(X)
-                model_score = float(detector.model.decision_function(X_scaled)[0])
-                is_model_suspicious = model_score < SCORE_THRESHOLD
-            except Exception:
-                is_model_suspicious = detector.predict(window_features) == 1
+            if detector is not None:
+                try:
+                    X = np.array([[
+                        window_features["speed_mean"],
+                        window_features["speed_std"],
+                        window_features["angle_mean"],
+                        window_features["angle_std"],
+                        window_features["acc_mean"],
+                        window_features["acc_std"],
+                        window_features["time_mean"],
+                        window_features["hand_mean"],
+                        window_features["hand_std"],
+                        window_features["stop_mean"],
+                        window_features["stop_std"],
+                        window_features["crouch_ratio"],
+                        window_features["hand_speed"],
+                        window_features["body_expansion"],
+                        window_features["crowd_count"],
+                        window_features["crowd_density_ratio"],
+                        window_features["avg_person_distance"],
+                        window_features["crowd_mean_30"],
+                        window_features["crowd_std_30"]
+                    ]])
+                    X_scaled = detector.scaler.transform(X)
+                    model_score = float(detector.model.decision_function(X_scaled)[0])
+                    is_model_suspicious = model_score < SCORE_THRESHOLD
+                except Exception:
+                    try:
+                        is_model_suspicious = detector.predict(window_features) == 1
+                    except Exception:
+                        is_model_suspicious = _heuristic_suspicion(window_features)
+            else:
+                is_model_suspicious = _heuristic_suspicion(window_features)
 
             if is_model_suspicious:
                 risk += RISK_INC
