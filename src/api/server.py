@@ -36,6 +36,7 @@ GESTURE_BONUS = 1.0
 MAX_EVENTS = int(os.getenv("CCTV_MAX_EVENTS", "40"))
 EVENT_INTERVAL = float(os.getenv("CCTV_EVENT_INTERVAL", "3.0"))
 FRAME_SKIP = max(1, int(os.getenv("CCTV_FRAME_SKIP", "2")))
+FRAME_API_IMGSZ = int(os.getenv("CCTV_FRAME_API_IMGSZ", "416"))
 CAMERA_NAME = os.getenv("CCTV_CAMERA", "CAM-01")
 LOCATION_NAME = os.getenv("CCTV_LOCATION", "shop aisle")
 
@@ -750,7 +751,7 @@ async def process_frame(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail="Invalid image frame.")
 
     model = _get_frame_model()
-    results = model(frame)
+    results = model.predict(frame, imgsz=FRAME_API_IMGSZ, conf=0.5, verbose=False)
 
     detections = []
     for result in results:

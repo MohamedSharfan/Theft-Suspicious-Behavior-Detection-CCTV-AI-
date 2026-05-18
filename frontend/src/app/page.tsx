@@ -187,7 +187,7 @@ export default function DashboardPage() {
     async function startWebcam() {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480 },
+          video: { width: 640, height: 360 },
           audio: false
         });
 
@@ -209,20 +209,37 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
+    let isActive = true;
     const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 480;
     const context = canvas.getContext("2d");
+    const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
-    async function sendFrame() {
-      const video = videoRef.current;
-      if (!video || !context || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        return;
-      }
+    async function captureBlob(video: HTMLVideoElement) {
+      const width = 640;
+      const height = 360;
+      canvas.width = width;
+      canvas.height = height;
+      context?.drawImage(video, 0, 0, width, height);
 
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob(async (blob) => {
-        if (!blob) return;
+      return new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.62);
+      });
+    }
+
+    async function sendFrameLoop() {
+      while (isActive) {
+        const startedAt = performance.now();
+        const video = videoRef.current;
+        if (!video || !context || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          await wait(120);
+          continue;
+        }
+
+        const blob = await captureBlob(video);
+        if (!blob) {
+          await wait(120);
+          continue;
+        }
 
         const formData = new FormData();
         formData.append("file", blob, "frame.jpg");
@@ -230,14 +247,19 @@ export default function DashboardPage() {
         try {
           const response = await fetch(`${apiBase}/api/frame`, {
             method: "POST",
+            cache: "no-store",
             body: formData
           });
 
-          if (!response.ok) return;
+          if (!response.ok) {
+            await wait(250);
+            continue;
+          }
 
           const payload = await response.json();
           const detections = Array.isArray(payload?.detections) ? payload.detections : [];
           setFrameDetections(detections);
+          setWebcamStatus(`Analyzing live feed (${detections.length})`);
           setMetrics((current) => ({
             ...current,
             subjects: detections.length
@@ -245,11 +267,16 @@ export default function DashboardPage() {
         } catch (error) {
           setWebcamStatus("Backend frame API unavailable");
         }
-      }, "image/jpeg", 0.78);
+
+        const elapsed = performance.now() - startedAt;
+        await wait(Math.max(80, 220 - elapsed));
+      }
     }
 
-    const timer = window.setInterval(sendFrame, 300);
-    return () => window.clearInterval(timer);
+    sendFrameLoop();
+    return () => {
+      isActive = false;
+    };
   }, [apiBase]);
 
   async function submitQuestion(event: FormEvent<HTMLFormElement>) {
@@ -477,9 +504,9 @@ function CameraPanel({
 
 function FrameBox({ detection, index }: { detection: FrameDetection; index: number }) {
   const left = `${(detection.x / 640) * 100}%`;
-  const top = `${(detection.y / 480) * 100}%`;
+  const top = `${(detection.y / 360) * 100}%`;
   const width = `${(detection.w / 640) * 100}%`;
-  const height = `${(detection.h / 480) * 100}%`;
+  const height = `${(detection.h / 360) * 100}%`;
 
   return (
     <div
