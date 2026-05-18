@@ -113,6 +113,8 @@ _latest_metrics = {
 }
 _frame_model = None
 _frame_model_lock = Lock()
+_frame_pipeline = None
+_frame_pipeline_lock = Lock()
 
 
 class ChatRequest(BaseModel):
@@ -172,6 +174,31 @@ def _score_to_risk(model_score: float | None, risk: float) -> float:
         scaled = 1 / (1 + np.exp(model_score))
         return float(min(max(scaled, 0.0), 1.0))
     return float(min(max(risk / (ALERT_RISK * 2.0), 0.0), 1.0))
+
+
+def _risk_level_from_raw(risk: float) -> str:
+    if risk < RISK_LOW:
+        return "LOW"
+    if risk < RISK_MID:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def _get_frame_pipeline() -> dict:
+    global _frame_pipeline
+    with _frame_pipeline_lock:
+        if _frame_pipeline is None:
+            _frame_pipeline = {
+                "tracker": DeepSort(max_age=45, n_init=2, nn_budget=200),
+                "extractor": FeatureExtractor(),
+                "detector": AnomalyDetector(),
+                "pose_estimator": PoseEstimator(),
+                "pose_extractor": PoseFeatureExtractor(),
+                "suspicion_history": {},
+                "crowd_history": [],
+                "last_frame_time": time.time()
+            }
+        return _frame_pipeline
 
 
 def _safe_explain(event: dict) -> dict:
@@ -506,7 +533,7 @@ def _process_stream() -> None:
                     if 0 <= px < frame.shape[1] and 0 <= py < frame.shape[0]:
                         pose_points.append({"x": px, "y": py})
 
-            extractor.update(track_id, (x1, y1, x2, y2), frame.shape, pose_landmarks)
+            extractor.update(track_id, (x1, y1, x2 - x1, y2 - y1), frame.shape, pose_landmarks)
             window_features = extractor.get_window_features(track_id)
             if window_features is None:
                 risk = suspicion_history.get(track_id, 0.0)
@@ -750,34 +777,257 @@ async def process_frame(file: UploadFile = File(...)) -> dict:
     if frame is None:
         raise HTTPException(status_code=400, detail="Invalid image frame.")
 
+    frame = cv2.resize(frame, (640, 360))
     model = _get_frame_model()
-    results = model.predict(frame, imgsz=FRAME_API_IMGSZ, conf=0.5, verbose=False)
+    pipeline = _get_frame_pipeline()
+    tracker = pipeline["tracker"]
+    extractor = pipeline["extractor"]
+    detector = pipeline["detector"]
+    pose_estimator = pipeline["pose_estimator"]
+    pose_extractor = pipeline["pose_extractor"]
+    suspicion_history = pipeline["suspicion_history"]
+    crowd_history = pipeline["crowd_history"]
 
-    detections = []
+    results = model.predict(frame, imgsz=FRAME_API_IMGSZ, conf=0.4, verbose=False)
+
+    raw_detections = []
     for result in results:
         for box in result.boxes:
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if class_id != 0 or confidence < 0.5:
+            if class_id != 0 or confidence < 0.4:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            detections.append(
-                {
-                    "x": x1,
-                    "y": y1,
-                    "w": max(0, x2 - x1),
-                    "h": max(0, y2 - y1),
-                    "confidence": confidence
-                }
+            raw_detections.append(([x1, y1, max(0, x2 - x1), max(0, y2 - y1)], confidence, "person"))
+
+    tracks = tracker.update_tracks(raw_detections, frame=frame)
+    valid_tracks = [
+        track
+        for track in tracks
+        if track.time_since_update <= 1 and (track.is_confirmed() or raw_detections)
+    ]
+
+    crowd_count = len(valid_tracks)
+    if crowd_count > 8:
+        crowd_density = "high"
+    elif crowd_count > 4:
+        crowd_density = "medium"
+    else:
+        crowd_density = "low"
+
+    frame_area = frame.shape[0] * frame.shape[1]
+    crowd_density_ratio = crowd_count / (frame_area + 1e-6)
+    centers = []
+    for track in valid_tracks:
+        x1, y1, x2, y2 = track.to_ltrb()
+        centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+
+    if len(centers) > 1:
+        dists = []
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                dists.append(np.linalg.norm(np.array(centers[i]) - np.array(centers[j])))
+        avg_person_distance = float(np.mean(dists))
+    else:
+        avg_person_distance = 999.0
+
+    crowd_history.append(crowd_count)
+    if len(crowd_history) > 30:
+        crowd_history.pop(0)
+
+    crowd_mean_30 = float(np.mean(crowd_history)) if crowd_history else 0.0
+    crowd_std_30 = float(np.std(crowd_history)) if crowd_history else 0.0
+
+    now = time.time()
+    dt = max(now - pipeline["last_frame_time"], 1e-6)
+    fps = 1.0 / dt
+    pipeline["last_frame_time"] = now
+
+    detections = []
+    suspicious_count = 0
+
+    for track in valid_tracks:
+        track_id = int(track.track_id)
+        x1, y1, x2, y2 = map(int, track.to_ltrb())
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        person_crop = frame[y1:y2, x1:x2]
+        pose_landmarks = None
+        if person_crop.size:
+            try:
+                pose_landmarks = pose_estimator.estimate(person_crop)
+            except Exception:
+                pose_landmarks = None
+
+        pose_points = []
+        if pose_landmarks:
+            for lm in pose_landmarks:
+                if len(lm) < 2:
+                    continue
+                px = int(x1 + float(lm[0]) * (x2 - x1))
+                py = int(y1 + float(lm[1]) * (y2 - y1))
+                if 0 <= px < frame.shape[1] and 0 <= py < frame.shape[0]:
+                    pose_points.append({"x": px, "y": py})
+
+        extractor.update(track_id, (x1, y1, x2 - x1, y2 - y1), frame.shape, pose_landmarks)
+        window_features = extractor.get_window_features(track_id)
+        risk = suspicion_history.get(track_id, 0.0)
+        model_score = None
+
+        if window_features is not None:
+            pose_features = pose_extractor.extract(track_id, pose_landmarks)
+            if pose_features:
+                window_features.update(pose_features)
+
+            window_features["crowd_count"] = crowd_count
+            window_features["crowd_density_ratio"] = crowd_density_ratio
+            window_features["avg_person_distance"] = avg_person_distance
+            window_features["crowd_mean_30"] = crowd_mean_30
+            window_features["crowd_std_30"] = crowd_std_30
+
+            is_model_suspicious = None
+            try:
+                X = np.array([[
+                    window_features["speed_mean"],
+                    window_features["speed_std"],
+                    window_features["angle_mean"],
+                    window_features["angle_std"],
+                    window_features["acc_mean"],
+                    window_features["acc_std"],
+                    window_features["time_mean"],
+                    window_features["hand_mean"],
+                    window_features["hand_std"],
+                    window_features["stop_mean"],
+                    window_features["stop_std"],
+                    window_features["crouch_ratio"],
+                    window_features["hand_speed"],
+                    window_features["body_expansion"],
+                    window_features["crowd_count"],
+                    window_features["crowd_density_ratio"],
+                    window_features["avg_person_distance"],
+                    window_features["crowd_mean_30"],
+                    window_features["crowd_std_30"]
+                ]])
+                X_scaled = detector.scaler.transform(X)
+                model_score = float(detector.model.decision_function(X_scaled)[0])
+                is_model_suspicious = model_score < SCORE_THRESHOLD
+            except Exception:
+                is_model_suspicious = detector.predict(window_features) == 1
+
+            if is_model_suspicious:
+                risk += RISK_INC
+            else:
+                risk -= RISK_DEC
+
+            gesture_sus = (
+                window_features.get("hand_speed", 0) > HAND_SPEED_THRESH
+                and window_features.get("hand_mean", 0) > HAND_DIST_THRESH
             )
+            if gesture_sus:
+                risk += GESTURE_BONUS
+
+            risk = max(RISK_MIN, min(risk, RISK_MAX))
+            suspicion_history[track_id] = risk
+
+        level = _risk_level_from_raw(risk)
+        risk_score = _score_to_risk(model_score, risk)
+        status = "suspicious" if risk >= ALERT_RISK else "normal"
+        if status == "suspicious":
+            suspicious_count += 1
+
+        track_confidence = getattr(track, "det_conf", 1.0)
+        if callable(track_confidence):
+            try:
+                track_confidence = track_confidence()
+            except Exception:
+                track_confidence = 1.0
+        if track_confidence is None:
+            track_confidence = 1.0
+
+        detections.append(
+            {
+                "id": track_id,
+                "x": x1,
+                "y": y1,
+                "w": max(0, x2 - x1),
+                "h": max(0, y2 - y1),
+                "confidence": float(track_confidence),
+                "risk": float(risk_score),
+                "risk_raw": float(risk),
+                "risk_level": level,
+                "status": status,
+                "pose": pose_points
+            }
+        )
+
+        if status != "suspicious" or window_features is None or not _should_emit(track_id, status):
+            continue
+
+        reason = _build_reason(window_features)
+        if reason == "no clear suspicious behaviors":
+            reason = "Multiple suspicious activity patterns detected"
+        behavior_chain = _build_behavior_chain(window_features)
+        recommendation = _build_recommendation(risk_score)
+        ai_result = _safe_explain(
+            {
+                "person_id": track_id,
+                "loitering": window_features.get("time_mean", 0) > 15,
+                "direction_change": window_features.get("angle_mean", 0) > 0.4,
+                "frequent_stopping": window_features.get("stop_mean", 0) > 10,
+                "crouching": window_features.get("crouch_ratio", 0) > 0.5,
+                "hand_distance": window_features.get("hand_mean", 0),
+                "risk_score": round(risk, 2),
+                "crowd_density": crowd_density,
+                "location": LOCATION_NAME
+            }
+        )
+        explanation = ai_result.get("explanation", "")
+        if _needs_suspicious_override(explanation):
+            explanation = (
+                f"Behavioral anomalies observed: {reason}. "
+                f"Crowd density {crowd_density}. "
+                f"Risk score {round(risk_score * 100, 1)}%."
+            )
+
+        alert_message = ai_result.get("alert_message", "")
+        if _needs_suspicious_override(alert_message):
+            alert_message = f"Suspicious activity detected. Verify subject {track_id} on {CAMERA_NAME}."
+
+        event = {
+            "id": int(time.time() * 1000),
+            "timestamp": _now_stamp(),
+            "person_id": track_id,
+            "risk_score": float(risk_score),
+            "status": status,
+            "reason": reason,
+            "alert": alert_message,
+            "camera": CAMERA_NAME,
+            "explanation": explanation,
+            "behavior_chain": behavior_chain,
+            "recommendation": recommendation
+        }
+
+        from src.reports.incident_report import generate_report
+        from src.memory.event_store import store_event
+
+        _set_report(generate_report(event))
+        _push_event(event)
+        store_event(event)
+        send_telegram_alert(alert_message)
+        _mark_emitted(track_id, status)
 
     _set_metrics(
         {
             "subjects": len(detections),
-            "suspicious": 0,
-            "fps": 0.0,
+            "suspicious": suspicious_count,
+            "fps": round(fps, 1),
             "camera_count": 1
         }
     )

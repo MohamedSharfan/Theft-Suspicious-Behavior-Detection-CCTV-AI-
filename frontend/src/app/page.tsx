@@ -49,11 +49,17 @@ type Metrics = {
 };
 
 type FrameDetection = {
+  id?: number;
   x: number;
   y: number;
   w: number;
   h: number;
   confidence: number;
+  risk?: number;
+  risk_raw?: number;
+  risk_level?: "LOW" | "MEDIUM" | "HIGH";
+  status?: "normal" | "suspicious";
+  pose?: { x: number; y: number }[];
 };
 
 const initialEvents: SecurityEvent[] = [];
@@ -463,7 +469,7 @@ function CameraPanel({
         </div>
 
         {detections.map((detection, index) => (
-          <FrameBox key={`${detection.x}-${detection.y}-${index}`} detection={detection} index={index} />
+          <FrameBox key={`${detection.id ?? index}-${detection.x}-${detection.y}`} detection={detection} index={index} />
         ))}
 
 
@@ -507,15 +513,38 @@ function FrameBox({ detection, index }: { detection: FrameDetection; index: numb
   const top = `${(detection.y / 360) * 100}%`;
   const width = `${(detection.w / 640) * 100}%`;
   const height = `${(detection.h / 360) * 100}%`;
+  const level = detection.risk_level ?? "LOW";
+  const tone =
+    level === "HIGH"
+      ? "border-red-400 text-red-100 bg-red-500/20 shadow-[0_0_18px_rgba(248,113,113,0.35)]"
+      : level === "MEDIUM"
+        ? "border-yellow-300 text-yellow-100 bg-yellow-400/20 shadow-[0_0_18px_rgba(250,204,21,0.25)]"
+        : "border-green-400 text-green-100 bg-green-500/20 shadow-[0_0_18px_rgba(74,222,128,0.22)]";
+  const label = `ID:${detection.id ?? index + 1} ${level} (${(detection.risk_raw ?? 0).toFixed(1)})`;
 
   return (
     <div
-      className="absolute rounded-sm border-2 border-cyan-300 shadow-cyan"
+      className={`absolute rounded-sm border-2 ${tone}`}
       style={{ left, top, width, height }}
     >
-      <span className="absolute -top-7 left-0 whitespace-nowrap rounded-sm bg-cyan-500/20 px-2 py-1 font-mono text-[11px] text-cyan-100 backdrop-blur">
-        Person {index + 1} / {Math.round(detection.confidence * 100)}%
+      <span className={`absolute -top-7 left-0 whitespace-nowrap rounded-sm border px-2 py-1 font-mono text-[11px] backdrop-blur ${tone}`}>
+        {label}
       </span>
+      {detection.pose?.map((point, pointIndex) => (
+        <span
+          key={`${detection.id ?? index}-pose-${pointIndex}`}
+          className="absolute h-1.5 w-1.5 rounded-full bg-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.9)]"
+          style={{
+            left: `${((point.x - detection.x) / Math.max(detection.w, 1)) * 100}%`,
+            top: `${((point.y - detection.y) / Math.max(detection.h, 1)) * 100}%`
+          }}
+        />
+      ))}
+      {detection.status === "suspicious" && (
+        <span className="absolute -bottom-7 left-0 whitespace-nowrap rounded-sm border border-red-300/50 bg-red-500/20 px-2 py-1 font-mono text-[11px] uppercase text-red-100 backdrop-blur">
+          Suspicious
+        </span>
+      )}
     </div>
   );
 }
