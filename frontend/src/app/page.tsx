@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, RefObject, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity,
@@ -46,6 +46,14 @@ type Metrics = {
   suspicious: number;
   fps: number;
   camera_count: number;
+};
+
+type FrameDetection = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  confidence: number;
 };
 
 const initialEvents: SecurityEvent[] = [];
@@ -115,6 +123,9 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const [frameDetections, setFrameDetections] = useState<FrameDetection[]>([]);
+  const [webcamStatus, setWebcamStatus] = useState("Starting webcam...");
+  const videoRef = useRef<HTMLVideoElement>(null);
   const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
   const latestEvent = events[0] ?? null;
@@ -131,7 +142,7 @@ export default function DashboardPage() {
         const payload = await response.json();
         if (!isActive) return;
 
-        const incoming = Array.isArray(payload?.events) ? payload.events : [];
+        const incoming: SecurityEvent[] = Array.isArray(payload?.events) ? payload.events : [];
         const suspiciousIncoming = incoming.filter((event) => event.status === "suspicious");
         if (suspiciousIncoming.length > 0) {
           setEvents(suspiciousIncoming);
@@ -155,6 +166,77 @@ export default function DashboardPage() {
       isActive = false;
       window.clearInterval(timer);
     };
+  }, [apiBase]);
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    async function startWebcam() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 },
+          audio: false
+        });
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+          setWebcamStatus("Webcam active");
+        }
+      } catch (error) {
+        setWebcamStatus("Webcam permission needed");
+      }
+    }
+
+    startWebcam();
+
+    return () => {
+      stream?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 480;
+    const context = canvas.getContext("2d");
+
+    async function sendFrame() {
+      const video = videoRef.current;
+      if (!video || !context || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        return;
+      }
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+
+        const formData = new FormData();
+        formData.append("file", blob, "frame.jpg");
+
+        try {
+          const response = await fetch(`${apiBase}/api/frame`, {
+            method: "POST",
+            body: formData
+          });
+
+          if (!response.ok) return;
+
+          const payload = await response.json();
+          const detections = Array.isArray(payload?.detections) ? payload.detections : [];
+          setFrameDetections(detections);
+          setMetrics((current) => ({
+            ...current,
+            subjects: detections.length
+          }));
+        } catch (error) {
+          setWebcamStatus("Backend frame API unavailable");
+        }
+      }, "image/jpeg", 0.78);
+    }
+
+    const timer = window.setInterval(sendFrame, 300);
+    return () => window.clearInterval(timer);
   }, [apiBase]);
 
   async function submitQuestion(event: FormEvent<HTMLFormElement>) {
@@ -208,9 +290,11 @@ export default function DashboardPage() {
 
         <section className="grid h-auto grid-cols-1 gap-4 xl:h-[calc(100vh-116px)] xl:grid-cols-[1.8fr_0.7fr_0.7fr]">
           <CameraPanel
-            apiBase={apiBase}
             latestEvent={latestEvent}
             isSuspicious={isSuspicious}
+            detections={frameDetections}
+            videoRef={videoRef}
+            webcamStatus={webcamStatus}
           />
           <AnalysisPanel events={events} />
           <AssistantPanel
@@ -294,13 +378,17 @@ function StatusPill({
 }
 
 function CameraPanel({
-  apiBase,
   latestEvent,
-  isSuspicious
+  isSuspicious,
+  detections,
+  videoRef,
+  webcamStatus
 }: {
-  apiBase: string;
   latestEvent: SecurityEvent | null;
   isSuspicious: boolean;
+  detections: FrameDetection[];
+  videoRef: RefObject<HTMLVideoElement>;
+  webcamStatus: string;
 }) {
   return (
     <motion.section
@@ -319,19 +407,24 @@ function CameraPanel({
             : "border-cyan-300/25 shadow-cyan"
         }`}
       >
-        <img
-          src={`${apiBase}/api/stream`}
-          alt="Live CCTV stream"
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          autoPlay
           className="absolute inset-0 h-full w-full object-contain opacity-95"
-          loading="eager"
         />
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_24%,rgba(79,140,255,0.24),transparent_24rem),linear-gradient(145deg,#07111f,#101827_44%,#070b14)] opacity-40" />
         <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-cyan-300/10 to-transparent" />
 
         <div className="absolute left-5 top-5 flex items-center gap-2 rounded-md border border-cyan-300/25 bg-black/40 px-3 py-2 font-mono text-xs text-cyan-100 backdrop-blur">
           <CircleDot className="h-3.5 w-3.5 animate-pulse text-red-300" />
-          LIVE FEED
+          {webcamStatus}
         </div>
+
+        {detections.map((detection, index) => (
+          <FrameBox key={`${detection.x}-${detection.y}-${index}`} detection={detection} index={index} />
+        ))}
 
 
         {isSuspicious && (
@@ -365,6 +458,25 @@ function CameraPanel({
         )}
       </div>
     </motion.section>
+  );
+}
+
+
+function FrameBox({ detection, index }: { detection: FrameDetection; index: number }) {
+  const left = `${(detection.x / 640) * 100}%`;
+  const top = `${(detection.y / 480) * 100}%`;
+  const width = `${(detection.w / 640) * 100}%`;
+  const height = `${(detection.h / 480) * 100}%`;
+
+  return (
+    <div
+      className="absolute rounded-sm border-2 border-cyan-300 shadow-cyan"
+      style={{ left, top, width, height }}
+    >
+      <span className="absolute -top-7 left-0 whitespace-nowrap rounded-sm bg-cyan-500/20 px-2 py-1 font-mono text-[11px] text-cyan-100 backdrop-blur">
+        Person {index + 1} / {Math.round(detection.confidence * 100)}%
+      </span>
+    </div>
   );
 }
 
@@ -648,4 +760,3 @@ function PanelTitle({
     </div>
   );
 }
-

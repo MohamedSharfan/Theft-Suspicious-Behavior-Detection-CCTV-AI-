@@ -15,4 +15,5 @@ protobuf
 groq
 fastapi
 uvicorn
+python-multipart
 reportlab
